@@ -81,7 +81,71 @@ location is Omarchy's shared file afterwards, and the picker edits it there.
 
 Keep attribution: data credits (RainViewer, Open-Meteo, Copernicus
 CAMS/ECMWF, Natural Earth) in README's data-sources section, and code credits
-(kuki, omarchy-weather-radar) in README's credits and in LICENSE.
+(kuki, omarchy-weather-radar) in README's credits and in LICENSE. The map
+carries its own credit line too, and it is per view — RainViewer over Natural
+Earth, or Copernicus CAMS/ECMWF over Natural Earth — because on screen that
+line is a caption in the corner and in a shared file it is the difference
+between an attributed picture and an unattributed one. `lib/Share.js` owns
+the table, next to the naming and the frame window, so the two cannot drift.
+
+## Sharing
+
+The map can be kept. A share is a grab of the map item — `Item.grabToImage`,
+which renders the item and its children — so the basemap, the radar frame, the
+air overlay, the rings and the credit line are composited by Qt into one PNG.
+There is no second map to keep in step with the first and no image library in
+the loop. Which is also why the legend has to be a child of the map during an
+export: the panel's own strip is a sibling of the map and a grab cannot see
+it, and an air-quality image with no scale on it is a picture of a colour
+field. So the map grows a second, normally-invisible `LegendStrip` and a veil,
+both gated on one `exporting` property, and the progress line lives outside
+the map precisely so it is never baked into a frame.
+
+A loop is the radar's own transport, driven one frame at a time instead of by
+the playback timer: stage the frame, wait for the swap, wait out the crossfade,
+grab. Nothing re-renders the map or re-requests a tile, and the share is paced
+by the network rather than by a clock. Only the radar is offered a loop,
+because only the radar has a transport — a CAMS forecast is never scrubbed, so
+there is no sequence of it to animate, and offering a one-frame GIF would be a
+worse answer than the still. Everything a share borrows — the frame index, the
+followed time, the transport — is handed back on every path out, including
+cancel and failure; a share that left the panel on a different frame than the
+user was looking at would be the worst bug in the plugin.
+
+`share.py` is the isolated share helper, in the shape of `cams.py`: three
+subcommands, an argv array, an absolute interpreter, stdlib only. A still is a
+byte copy, because the grab is already a PNG and the map already draws its own
+attribution. A loop is the only encoding in the tree — median cut, a 4-bit
+lookup cube, serpentine error diffusion, LZW — and it is a hundred lines of
+arithmetic rather than a package this plugin would otherwise not need. The
+lookup cube is what makes that affordable: without it every pixel of every
+frame would be compared against every palette entry.
+
+Every path the helper writes goes through a directory walk with held
+descriptors, an `O_EXCL` temporary, `fsync`, and `rename` — the manual's own
+shape, not a new one. A directory it owns is refused rather than repaired when
+it is not private, and the refusal names the command that fixes it. It demands
+that of `share`, the directory it creates, and not of
+`~/.config/omarchy/akash`, which the rest of this plugin created under the
+default umask before any share could happen: holding a pre-existing directory
+to a mode the plugin itself does not use refuses every share on every install.
+Frames are read through the descriptor that was checked. The one boundary this
+design does not close is `saveToFile`, which Qt opens by name: the name comes
+from `mkdtemp` inside a 700 directory the helper created and then deletes, so
+it is the manual's same-UID hardening class rather than a blocker, and it is
+written down here rather than left in a comment.
+
+The helper's stderr is collected, not discarded, and becomes the body of the
+failure toast. A share that can only report "it did not save" is a support
+ticket waiting to happen, and the reason lives on exactly the stream a plugin
+is most likely to forget it has claimed. The collector only accumulates; the
+text is read where the exit code is known, because `onStreamFinished` fires
+first and a refusal read there would look like one that completed.
+
+The name is reduced to `[a-z0-9-]` before it reaches a path, and a CAMS layer
+title is remote text. That is why the share notification needs no strip pass:
+the sink is safe by construction, and a strip pass over an already-safe string
+would be the appearance of a check rather than one.
 
 ## Location, onboarding, and map
 
@@ -145,6 +209,32 @@ service's summary properties; they poll nothing themselves.
 
 `lib/*.js` are pure functions over plain values, one concern each, pinned by
 `node --test`. Anything that is not a pure function does not belong there.
+
+`share.py` is the isolated share helper, and is covered by its own section
+above; like `cams.py` it is stdlib-only, it is an argv array, and its parent
+directories are walked with held descriptors rather than resolved by name.
+
+The share chooser is a `qs.Ui.ConfirmDialog`, and it lives inside
+`ui/KeyboardPanel` with a `z` above the key catcher — the same place the
+shell's own dialogs sit. That placement is not cosmetic and not movable: the
+keyboard panel is a `PanelWindow`, so a dialog declared at the panel's own
+level is in a different window from the map and no `z` can raise it above one,
+and inside the window but below the key catcher it opens, paints underneath,
+and eats no clicks. Both failures look identical from the outside — a share
+button that does nothing.
+
+The dialog's two buttons and its dismissing gestures arrive through two
+signals, and the mapping is not the obvious one: `confirmed()` is the right
+button, `canceled()` is *both* the left button and a click on the scrim. So
+the left option has to be read out of `selectedIndex`, which a button sets to
+its own position as it is pressed and the scrim leaves alone — treating
+`canceled()` as a dismissal makes "PNG image" close the dialog and share
+nothing, which is a dead button that looks merely broken. All three ways in —
+the two buttons and Return — go through one function, because three copies of
+the if/else is three chances to get that mapping wrong, and it was wrong three
+times. Escape is handled by the panel and never routed through the dialog's
+own `handleKey`, which emits `canceled()` for it and would save an image nobody
+chose.
 
 `cams.py` is the isolated CAMS/network helper: the capabilities cache
 (`caps.json`, refreshed at most every 6 hours), the WMS `GetFeatureInfo`

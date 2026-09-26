@@ -117,6 +117,28 @@ Item {
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
 
+  // ---- Sharing ----------------------------------------------------------
+  //
+  // A share is a grab of this item: `Item.grabToImage` renders the item and
+  // its children, so the basemap, the radar frame, the air overlay, the rings
+  // and the credit line under it are all composited by Qt into one PNG. There
+  // is no second map to keep in step with this one and nothing to resize or
+  // draw in the helper.
+  //
+  // That is also why the legend has to be here rather than left in the panel
+  // column: the panel's own strip is a sibling of this item, so a grab of this
+  // item cannot see it. The overlay below carries the same strip in, visible
+  // only while a share is running, which is the only time it is wanted in the
+  // picture. An air-quality overlay without its scale is a picture of nothing
+  // in particular.
+  property bool exporting: false
+  property string legendMode: "radar"
+  property string legendLabel: ""
+  property string legendSpecies: ""
+
+  // The panel owns the capture; the map only says it was asked for.
+  signal shareRequested()
+
   Rectangle {
     id: canvasFrame
     anchors.fill: parent
@@ -244,6 +266,39 @@ Item {
       }
     }
 
+    // ---- The export legend -----------------------------------------------
+    // Docked at the foot of the map, the same width as the strip in the panel
+    // column, and hidden whenever no share is running — so a grab without an
+    // export in progress is exactly the map the user is looking at.
+    //
+    // One sibling rather than an overlay wrapping both this and a veil, because
+    // the legend anchors to the credit line and QML only lets an item anchor to
+    // a parent or a sibling.
+    //
+    // There is deliberately no veil over the map. A veil is the obvious way to
+    // say "this is being captured", and it is wrong here for a reason that only
+    // shows up in the artefact: it would be composited into the grab along with
+    // everything else, so every frame of a shared loop — and the shared still —
+    // would be 25% darker than the map the person was looking at. The progress
+    // row under the map says the same thing and is not in the picture.
+    LegendStrip {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      // Above the credit line rather than over it. The strip is as wide as the
+      // map and sits at the bottom of it, which is where the credit line
+      // already is — and a share is exactly the case where both end up in the
+      // same picture, so the collision would only ever show up in the artefact.
+      anchors.bottom: creditLine.top
+      anchors.bottomMargin: Style.space(4)
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      visible: root.exporting
+      bar: root.bar
+      mode: root.legendMode
+      layerLabel: root.legendLabel
+      layerSpecies: root.legendSpecies
+    }
+
     // ---- Pan and zoom ---------------------------------------------------
     MouseArea {
       anchors.fill: parent
@@ -305,7 +360,11 @@ Item {
       anchors.left: parent.left
       anchors.bottom: parent.bottom
       anchors.margins: Style.space(6)
-      visible: root.hasLocation
+      // Hidden while a share is running, which is a second reason beyond it
+      // being in the way: a grab composites this item and its children, so a
+      // crosshair in the corner of a shared map is a picture of the viewer's
+      // own controls, and it lands on top of the export legend.
+      visible: root.hasLocation && !root.exporting
       text: Glyphs.RECENTER
       fontFamily: Style.font.family
       foreground: root.foreground
@@ -315,7 +374,28 @@ Item {
       onClicked: root.recenterRequested()
     }
 
+    // Share, on the opposite corner from recentre so the two map gestures do
+    // not sit in a row. Top right rather than bottom, because the bottom is
+    // already spoken for twice over — the recentre button, and the credit line
+    // that a share has to carry out of the panel with it.
+    Button {
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.margins: Style.space(6)
+      // Gone rather than disabled, for the same reason as the recentre button
+      // above: a shared map should not contain a picture of the share button.
+      visible: !root.exporting
+      text: Glyphs.SHARE
+      fontFamily: Style.font.family
+      foreground: root.foreground
+      background: Color.popups.background
+      bordered: true
+      tooltipText: "Share this map (P)"
+      onClicked: root.shareRequested()
+    }
+
     Text {
+      id: creditLine
       textFormat: Text.PlainText
       anchors.right: parent.right
       anchors.bottom: parent.bottom

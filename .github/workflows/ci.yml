@@ -35,7 +35,9 @@ jobs:
         # test/load.js, which is a helper rather than a suite.
         run: node --test test/*.test.js
       - name: Python helper tests
-        run: python3 test/cams.test.py
+        run: |
+          python3 test/cams.test.py
+          python3 test/share.test.py
 
   shell:
     name: QML tests (Quickshell)
@@ -100,5 +102,6 @@ jobs:
           ./test/first-run.sh
           ./test/basemap-steps.sh
           ./test/legend.qml-test.sh
+          ./test/share.qml-test.sh
       - name: Lint the QML
         run: /usr/lib/qt6/bin/qmllint -I /usr/share/omarchy/shell -I . *.qml ui/*.qml

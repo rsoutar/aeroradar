@@ -196,3 +196,31 @@ test("notification bodies make the place name inert", () => {
   assert.ok(sites.length >= 2,
     "a notification body builds its place name without inertText")
 })
+
+// The tree has to be readable as text.
+//
+// SKILL.md is explicit that a literal NUL byte in a source file stops the
+// static baseline scan outright, and git agrees: a file with one is recorded
+// as binary, so a diff of it shows nothing and a review of it skips it. Both
+// happened here — a test case for "a NUL in a filename" was written with the
+// character instead of its escape, and the file went into a commit as binary
+// before anything noticed.
+//
+// The fix is to write `\u0000` and not the byte, which is only checkable by
+// looking for the byte, so this looks for the byte.
+test("no source file in the tree carries a control byte", () => {
+  const suspect = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/
+  const sources = [
+    ...readdirSync(ROOT).filter(name => /\.(qml|js|py|json|md|sh|yml)$/.test(name)).map(name => name),
+    ...readdirSync(join(ROOT, "ui")).filter(name => name.endsWith(".qml")).map(name => join("ui", name)),
+    ...readdirSync(join(ROOT, "lib")).filter(name => name.endsWith(".js")).map(name => join("lib", name)),
+    ...readdirSync(join(ROOT, "test"))
+      .filter(name => /\.(js|py|sh)$/.test(name)).map(name => join("test", name))
+  ]
+
+  for (const name of sources) {
+    const text = readFileSync(join(ROOT, name))
+    assert.ok(!suspect.test(text),
+      `${name} carries a literal control byte; write the escape instead`)
+  }
+})
