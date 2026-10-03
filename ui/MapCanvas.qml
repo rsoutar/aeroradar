@@ -132,6 +132,19 @@ Item {
   // picture. An air-quality overlay without its scale is a picture of nothing
   // in particular.
   property bool exporting: false
+
+  // The resolution an export is being taken at, as a multiple of the map's own
+  // pixels. Only the air overlay has anything to spend it on — the WMS renders
+  // whatever it is asked for — so this is the scale its GetMap goes out at, and
+  // 1 the rest of the time.
+  property real exportScale: 1
+
+  // The air layer is done trying, either because it has the picture at
+  // `exportScale` or because it has run out of ways to get one. The panel owns
+  // the capture and cannot see the layer, so the map passes it on.
+  signal airSettled()
+  readonly property bool airStale: airLayer.stale
+
   property string legendMode: "radar"
   property string legendLabel: ""
   property string legendSpecies: ""
@@ -209,6 +222,10 @@ Item {
       zoom: root.zoom
       layerName: root.airLayerName
       stepTime: root.airStepTime
+      // A share is about to photograph this at `exportScale`, so the GetMap
+      // goes out at that size rather than at the size of what is on screen.
+      requestScale: root.exporting ? root.exportScale : 1
+      onSettled: root.airSettled()
     }
 
     // ---- Alert rings and home marker ------------------------------------

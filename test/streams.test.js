@@ -178,6 +178,89 @@ test("a share outside the radar grabs at once rather than staging a frame", () =
     "the non-radar branch does not grab the frame it is already showing")
 })
 
+test("an air-quality share waits for the overlay it just asked to re-fetch", () => {
+  // A share raises the overlay's resolution on the way in, and the layer holds
+  // the coarser picture until its own GetMap answers — and *both* of its buffers
+  // sit at zero opacity while that request is out. So a share that grabs before
+  // it lands photographs a map with no air overlay on it at all, which is the
+  // one thing the export legend exists to make readable.
+  const panel = source["Panel.qml"]
+  const branch = bodyOf(panel, "function captureNextFrame")
+  const between = branch.slice(branch.indexOf("if (!root.radarMode)"),
+    branch.indexOf("setTimelineIndex(index)"))
+
+  // `stale`, not `loading`: the layer's rebuild sits behind a 250ms debounce, so
+  // `loading` reads false in the window right after the scale changes — which is
+  // exactly when captureNextFrame runs.
+  assert.match(between, /if \(map\.airStale\)/,
+    "the non-radar branch grabs without checking whether the overlay is current")
+  assert.match(between, /shareAirWaiting = true/,
+    "the wait is not recorded, so the overlay cannot tell its grab from a second one")
+  assert.match(between, /shareFence\.restart\(\)/,
+    "the wait has no floor: a GetMap that never answers must not hang the share")
+
+  const air = source["ui/AirLayer.qml"]
+  assert.match(air, /readonly property bool stale: liveBuffer !== -1/,
+    "stale does not require a buffer, so a layer with no overlay waits for one")
+  assert.match(air, /mapUrl\(layerName, "", bbox, requestWidth, requestHeight, stepTime\)/,
+    "the GetMap is not asked for the resolution it will be saved at")
+
+  // A buffer carries the scale it was fetched at, and `stale` reads that — not
+  // the layer's current scale. Crediting the buffer at request time instead
+  // clears `stale` the instant the GetMap leaves, which is exactly while both
+  // buffers are transparent.
+  assert.match(air, /img\.fetchedScale = requestScale/,
+    "the buffer being fetched is not credited with its scale")
+  assert.match(air, /readonly property real liveScale: liveBuffer === 1 \? bufB\.fetchedScale : bufA\.fetchedScale/,
+    "stale does not read the scale the buffer on screen was fetched at")
+  assert.doesNotMatch(air, /property real (buffer|requested)Scale/,
+    "a second, redundant scale state can disagree with the buffer it describes")
+  // And for the same reason no buffer may take its decode bound from the
+  // layer's current scale: that binding re-asks the *other* buffer for a
+  // surface it has no data for, and Qt reloads it — so the fallback a failed
+  // request leaves behind is a picture torn up rather than the one that was
+  // already there.
+  const bounds = air.match(/sourceSize:[\s\S]*?\n\s*\n/g) || []
+  assert.strictEqual(bounds.length, 2, "the two buffers no longer share one sourceSize")
+  for (const bound of bounds) {
+    assert.match(bound, /fetchedScale/,
+      "a buffer's decode bound follows the layer's current scale, not its own")
+  }
+
+  // Both outcomes release it, so a GetMap that answered with nothing does not
+  // leave the share sitting out its whole fence.
+  assert.match(blockOf(air, "function bufferReady\\(index\\) \\{", 2), /settled\(\)/,
+    "a landed buffer does not release the wait")
+  assert.match(blockOf(air, "function bufferFailed\\(index\\) \\{", 2), /settled\(\)/,
+    "a failed buffer does not release the wait")
+
+  // And only one grab: the fence and the overlay can both reach for one.
+  const grab = bodyOf(panel, "function grabFrame")
+  assert.match(grab, /shareAirWaiting = false/,
+    "grabFrame leaves the wait armed, so a late overlay asks for a second grab")
+  assert.match(bodyOf(panel, "function releaseAirGrab"), /if \(!root\.shareAirWaiting\) return/,
+    "releaseAirGrab does not check whether a grab is already owed")
+  assert.match(source["ui/MapCanvas.qml"], /onSettled: root\.airSettled\(\)/,
+    "the overlay's signal is not forwarded to the panel that owns the capture")
+  assert.match(panel, /onAirSettled: root\.releaseAirGrab\(\)/,
+    "the panel does not act on the overlay settling")
+})
+
+test("a still is grabbed at three times the map, a loop at its own size", () => {
+  // 3x is the point where the frame is still inside share.py's pixel ceiling:
+  // the largest map the panel builds is 560x320, so 1680x960 against 4 Mi px.
+  // A loop stays at 1x — eight frames at 2x is a file nobody waits for.
+  const panel = source["Panel.qml"]
+  assert.match(panel, /readonly property int stillScale: shareMode === "gif" \? 1 : 3/,
+    "the still scale is not declared once")
+  assert.match(bodyOf(panel, "function grabFrame"), /var scale = root\.stillScale/,
+    "the grab is not taken at the declared still scale")
+  // The overlay's request and the grab have to be the same number: the point of
+  // the request is to render at the size it is saved at.
+  assert.match(panel, /exportScale: root\.stillScale/,
+    "the air overlay is asked at a scale other than the one the grab takes")
+})
+
 test("a frame that is already on screen is not staged again", () => {
   // `setTimelineIndex` assigns `frameIndex = index`, which fires no signal when
   // the value is unchanged — so `showFrame` never runs, the swap is never

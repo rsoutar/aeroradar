@@ -42,9 +42,11 @@ import zlib
 # enough to hold in the head, and the test pins them.
 # ---------------------------------------------------------------------------
 
-# A grab of the map at 2x. The panel passes a targetSize it has already
+# A grab of the map at 3x. The panel passes a targetSize it has already
 # clamped; this is the second, independent bound, because the argument crosses
 # a process boundary and a caller is not to be trusted with an allocation.
+# The largest map the panel builds is 560x320, so 3x is 1680x960 — comfortably
+# inside this, and the reason 3x is where the panel stops.
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_FRAME_PIXELS = 4 * 1024 * 1024
 MAX_FRAMES = 16

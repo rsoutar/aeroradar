@@ -243,8 +243,10 @@ Press **P**, or click the share button in the top-right corner of the map.
 
 On the radar view it asks which you want:
 
-- **PNG image** — the map as you are looking at it, at twice its size on
-  screen.
+- **PNG image** — the map as you are looking at it, at three times its size on
+  screen. On an air-quality view the overlay is re-fetched at that resolution
+  first, so the colours are rendered at the size they are saved at rather than
+  scaled up into it.
 - **Animated GIF** — the last eight radar frames as a loop, at 300 ms a
   frame. The frames are the ones already in the timeline, so the loop is the
   storm's last hour and a half rather than anything new.

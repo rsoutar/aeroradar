@@ -1061,6 +1061,24 @@ Panel {
   // How long the frame list was when the share started. See captureNextFrame().
   property int shareFramesToken: -1
 
+  // That an air-quality share is waiting on the overlay to be re-fetched at the
+  // export resolution, so releaseAirGrab() knows the grab it is about to ask
+  // for is one that is genuinely owed rather than a second attempt at one
+  // already in flight. Cleared by grabFrame(), which every grab passes through.
+  property bool shareAirWaiting: false
+
+  // How many times the map's own size a still is taken at, and the scale the
+  // air overlay's GetMap goes out at. One number for both: the point is that the
+  // overlay is rendered at the size it is saved at, so a grab scale and a
+  // request scale that disagreed would buy one at the other's expense.
+  //
+  // Three is as far as it goes while the frame still fits what share.py will
+  // accept: the largest map the panel will build is 560x320, so 3x is 1680x960
+  // against a ceiling of four times that in pixels. A loop is taken at 1x —
+  // twice the pixels across eight frames is a file nobody waits for, and a GIF
+  // is watched small enough that the extra pixels would not survive the palette.
+  readonly property int stillScale: shareMode === "gif" ? 1 : 3
+
   // What the file is called, decided once at the start so a loop lands in one
   // file rather than one file per minute of the clock.
   property string shareStem: ""
@@ -1172,6 +1190,7 @@ Panel {
     root.shareRunDir = ""
     root.shareCursor = 0
     root.shareDone = 0
+    root.shareAirWaiting = false
 
     // Assigning the index stages the frame through onFrameIndexChanged, so
     // this is the whole of putting the picture back.
@@ -1210,6 +1229,20 @@ Panel {
       // refuses a view that is not the radar — and the only thing left to
       // release the grab would be the eight-second fence, which would make
       // every air-quality share feel like it had hung.
+      //
+      // Except that the share has just raised the overlay's resolution, and the
+      // layer is holding the coarser picture until its own GetMap answers. Both
+      // of its buffers are transparent while that request is out, so grabbing
+      // now would photograph a map with no overlay on it at all — the thing the
+      // legend is in the picture to explain. So this waits, and releaseAirGrab()
+      // is what releases it. The fence stays as the floor, for a GetMap that
+      // never answers: an air-quality share without its overlay, rather than
+      // one that never finishes.
+      if (map.airStale) {
+        shareAirWaiting = true
+        shareFence.restart()
+        return
+      }
       grabFrame()
       return
     }
@@ -1242,18 +1275,37 @@ Panel {
     shareFence.restart()
   }
 
+  // The air overlay is done being waited for, so the grab an air-quality share
+  // was holding back is released. Both outcomes release it — the sharper
+  // overlay arrived, or the layer gave up — because the fence releases it
+  // either way, and a share that waited for an answer to a question already
+  // answered is just a slower share.
+  //
+  // The flag is the guard that matters: without it, an overlay that lands after
+  // the fence has already taken its grab would ask for a second one, and two
+  // overlapping grabs of one item each photograph the other's half-finished
+  // state.
+  function releaseAirGrab() {
+    if (!root.shareAirWaiting) return
+    grabFrame()
+  }
+
   function grabFrame() {
     if (!root.sharing) return
     // The fence has done its job. Left running it would open a second grab of
     // the same item while the first was still queued, and two overlapping
     // grabs of one item each photograph the other's half-finished state.
     shareFence.stop()
+    // The same argument, for the air overlay: it can raise a grab of its own
+    // accord the moment its GetMap lands, and it cannot know whether the grab
+    // released by the fence is still in flight. Cleared here because this is
+    // the one place every grab passes through.
+    shareAirWaiting = false
 
-    // The still is grabbed at twice the map's own size, because it is the one
-    // meant to be posted. A loop is grabbed at 1x: twice the pixels across
-    // eight frames is a file nobody waits for, and the map is small enough
-    // that scaling it up would only show the basemap's own interpolation.
-    var scale = root.shareMode === "gif" ? 1 : 2
+    // The still is grabbed at three times the map's own size, because it is the
+    // one meant to be posted; see stillScale, which the air overlay's request
+    // is made at too.
+    var scale = root.stillScale
     var target = Qt.size(Math.max(1, Math.round(map.width * scale)),
       Math.max(1, Math.round(map.height * scale)))
     var destination = root.sharePaths[root.shareCursor]
@@ -1632,11 +1684,16 @@ Panel {
             // veil over the map while frames are being captured; the legend
             // fields are the same ones the panel's own strip below is bound
             // to, so the two cannot disagree about what the map is drawing.
+            // `exportScale` asks the air overlay for the resolution a still is
+            // about to be grabbed at — a loop is grabbed at the panel's own
+            // size, and has nothing to spend.
             exporting: root.sharing
+            exportScale: root.stillScale
             legendMode: root.airShown ? root.activeCategory : "radar"
             legendLabel: root.activeLayer ? CamsModel.layerLabel(root.activeLayer) : ""
             legendSpecies: root.activeLayer ? (root.activeLayer.species || "") : ""
             onShareRequested: root.requestShare()
+            onAirSettled: root.releaseAirGrab()
 
             onDragged: function(latitude, longitude) {
               root.viewLatitude = TileMath.constrainLatitude(latitude, root.zoom, root.mapHeight)
