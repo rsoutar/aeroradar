@@ -7,6 +7,7 @@ import "lib/Basemap.js" as Basemap
 import "lib/CamsModel.js" as CamsModel
 import "lib/RadarModel.js" as RadarModel
 import "lib/Settings.js" as Settings
+import "lib/Share.js" as Share
 
 // Headless singleton behind akash.
 //
@@ -785,6 +786,42 @@ Item {
   function reportCoverage(covered) {
     coverageChecked = true
     hasCoverage = covered === true
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reporting a finished share
+  // ---------------------------------------------------------------------------
+
+  // The panel does the capturing; this is where the toast comes from, because
+  // there is one notification channel in this plugin and adding a second would
+  // mean two processes racing to own the same toast. `reportCoverage` above is
+  // the same arrangement for the same reason.
+  //
+  // `why` is the share helper's own sentence, collected from its stderr because
+  // a share that fails with only "it did not save" is a support ticket waiting
+  // to happen. It is bounded and stripped in the panel before it gets here —
+  // `Share.plain` — and this function adds the cap, because the body is a
+  // markup-capable sink and the cap belongs at the sink too.
+  //
+  // No click action, for the reason the storm toast has none: a click means "I
+  // have seen this", and spending it on opening a file manager answers a
+  // question the reader did not ask. The path is in the body instead, and the
+  // clipboard already holds the picture itself.
+  readonly property int shareWhyMax: 200
+  function reportShare(headline, ok, why) {
+    notifyProc.command = [
+      "omarchy-notification-send",
+      "--app-name", "Akash",
+      "-g", Glyphs.SHARE,
+      // A share that failed says so at normal volume. A critical toast is
+      // reserved here for the storm and air-quality alerts, and spending it on
+      // a failed export teaches people to ignore it.
+      "-u", "normal",
+      headline,
+      ok ? "The map is also on your clipboard."
+        : Share.plain(why).slice(0, shareWhyMax)
+    ]
+    notifyProc.running = true
   }
 
   // ---------------------------------------------------------------------------

@@ -57,11 +57,26 @@ deletes the CAMS caches the plugin owns — see
 [What it writes](#what-it-writes). The stock weather widget's own state is
 left alone.
 
+**One thing survives removal, deliberately.** The maps you have shared stay in
+`~/Pictures/akash/` — they are yours, and deleting someone's weather on their
+behalf is not this plugin's call. Delete that directory yourself if you want
+them gone. Everything else the plugin owns is under `~/.config/omarchy/akash`
+and goes with the `rm -rf` above, including the decoded base map.
+
+A share interrupted by a shell restart can leave one directory behind in
+`~/.config/omarchy/akash/share/`, named `.run-*`. It holds only the map images
+captured so far, nothing is ever read from it again, and the same `rm -rf`
+removes it.
+
 ### Requirements
 
 - Omarchy Quattro (Quickshell shell)
 - `python3` — standard library only, no packages to install
 - `curl` — Omarchy already installs it
+- `wl-copy` (from `wl-clipboard`) — for putting a shared map on the
+  clipboard. Optional: without it the file is still written and the toast
+  still names it, only the clipboard is left alone. Omarchy ships
+  `wl-clipboard`.
 
 The base map needs nothing at all: it ships with the plugin as
 `data/basemap.bin` and works with no network. The first time the map opens
@@ -70,6 +85,10 @@ after a shell restart the file is decoded; the decoded form is cached in
 plugin update, or deleting that cache, pays for the decode again. The plugin
 also calls `omarchy-weather-location` to store a chosen city and
 `omarchy-notification-send` to raise an alert — both ship with Omarchy.
+
+Sharing needs nothing either, for the same reason: the GIF encoder is
+`share.py`, which is this plugin's own file and uses only the standard
+library. There is no ImageMagick, no ffmpeg, and no package to install.
 
 ## The map
 
@@ -80,8 +99,9 @@ also calls `omarchy-weather-location` to store a chosen city and
 | Play button, `Enter` | play the radar loop |
 | `←` / `→` | step the radar loop one frame |
 | Crosshair button, `Home` | recentre on your location |
+| Share button, `P` | save this map — an image, or a radar loop |
 | `Tab` | move to the neighbouring bar panel |
-| `Esc` | close |
+| `Esc` | close, or cancel a share in progress |
 
 The panel opens on your location and on the newest moment, every time —
 radar on top of the air-quality layers you have enabled, a scrubbing
@@ -195,17 +215,63 @@ notifications stay on screen until dismissed; lighter ones time out.
 
 ## What it writes
 
-The plugin writes only two places:
+The plugin writes only three places:
 
 - `~/.config/omarchy/akash/` — `caps.json`, a cache of the CAMS layer
-  list refreshed at most every 6 hours, and `state.json`, your chosen layers
-  and view.
+  list refreshed at most every 6 hours, `state.json`, your chosen layers
+  and view, and `basemap.cache`, the decoded base map, which is rewritten
+  only after a plugin update.
+- `~/Pictures/akash/` — the maps you share. Only when you ask for one, and
+  nothing else is ever put there. See [Sharing the map](#sharing-the-map).
 - Its entry in `~/.config/omarchy/shell.json` — bar placement and widget
   settings, managed by the `omarchy` CLI.
+
+A share in progress stages its frames in `~/.config/omarchy/akash/share/`, a
+private directory it creates and removes the moment the share finishes or is
+cancelled. Nothing there outlives the export unless the export was killed
+mid-write. That one directory is mode 700; the plugin's own directory beside it
+is left at whatever the rest of the plugin already uses, and a share will not
+change it.
 
 It reads `~/.local/state/omarchy/settings/weather.json` for your location but
 never writes it; that file belongs to the stock weather widget. Nothing else
 is written anywhere.
+
+## Sharing the map
+
+Press **P**, or click the share button in the top-right corner of the map.
+
+On the radar view it asks which you want:
+
+- **PNG image** — the map as you are looking at it, at three times its size on
+  screen. On an air-quality view the overlay is re-fetched at that resolution
+  first, so the colours are rendered at the size they are saved at rather than
+  scaled up into it.
+- **Animated GIF** — the last eight radar frames as a loop, at 300 ms a
+  frame. The frames are the ones already in the timeline, so the loop is the
+  storm's last hour and a half rather than anything new.
+
+Every other view — air quality, allergens, aerosols, UV — offers only the
+image, because a CAMS forecast is a series of predictions rather than
+something that happened, and the panel never scrubs it.
+
+The picture is the map, its legend, and a credit line for whoever drew the
+data. The legend is inside the picture on purpose: an air-quality image with
+no scale on it is a picture of a colour field.
+
+The file lands in `~/Pictures/akash/`, named for what it shows and when it was
+taken (`akash-radar-20260926-1430.gif`, `akash-pm25-20260926-1430.png`), and
+is also put on your clipboard so you can paste it straight into a message. If
+you share twice in the same minute the second file gets a `-2` rather than
+replacing the first.
+
+Escape, the `cancel` button, or **P** again stops a share in progress; the
+map is put back on the frame you were looking at either way. A share takes a
+few seconds — it is waiting for each frame's tiles, so it is paced by the
+network rather than by a timer.
+
+Nothing about a share touches the network, and nothing is written anywhere
+except the file above.
 
 ## Data sources
 
@@ -245,6 +311,7 @@ own runner; `cams.py` is tested with the standard library's `unittest`:
 ```bash
 node --test test/*.test.js
 python3 test/cams.test.py
+python3 test/share.test.py
 ```
 
 `test/streams.test.js` holds the QML sources to a written-down inventory of
@@ -253,8 +320,13 @@ plugin runs inside the process that owns the bar, the panels and the lock
 screen, so a stream added later without a limit fails the suite rather than
 turning up in a review. `test/qml-source.test.js` is the same kind of check
 aimed at the QML: every `Text` declares `Text.PlainText`, and notification
-bodies are made inert first. `test/cams.test.py` pins the Python helper's
-byte ceilings and its tolerance of renamed CAMS layers.
+bodies are made inert first. `test/cams.test.py` pins the CAMS helper's byte
+ceilings and its tolerance of renamed CAMS layers.
+`test/share.test.py` pins the share helper's two halves: the encoder, against
+a GIF decoder written separately from it so "it wrote bytes" is never mistaken
+for "a GIF reader can read them"; and the refusals, because a decision that
+quietly stopped being made about somebody else's file would change no output
+at all.
 
 The rest run the QML itself, under Quickshell rather than in Node. They skip
 where there is no `qs`, and `AKASH_REQUIRE_QS=1` turns that skip into a
@@ -264,6 +336,7 @@ failure:
 ./test/first-run.sh       # a machine that has never set a weather location
 ./test/basemap-steps.sh   # decoding the ground never stalls the shell
 ./test/legend.qml-test.sh # the map legend compiles and renders its two ramps
+./test/share.qml-test.sh  # the map grabs itself, and the grab makes a GIF
 ```
 
 They run `qs` with `QT_QPA_PLATFORM=offscreen`, so they need no desktop — but
@@ -279,7 +352,9 @@ CI runs the Node and Python suites on `ubuntu-latest` and the QML suites in an
 Arch container, where `quickshell` is packaged and the Omarchy shell modules
 that `legend.qml-test.sh` imports can be unpacked; see
 `.github/workflows/ci.yml`. Nothing reaches the network: the shell tests
-replace `curl` and `omarchy-weather-location` on `PATH`.
+replace `curl` and `omarchy-weather-location` on `PATH`, and
+`share.qml-test.sh` redirects `HOME` at a temporary directory because a share
+writes to `~/Pictures/akash`.
 
 QML is also checked statically, which needs the shell's modules on the import
 path:

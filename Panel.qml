@@ -7,7 +7,9 @@ import "ui"
 import "lib/Alerts.js" as Alerts
 import "lib/CamsModel.js" as CamsModel
 import "lib/Frames.js" as Frames
+import "lib/Glyphs.js" as Glyphs
 import "lib/Settings.js" as Settings
+import "lib/Share.js" as Share
 import "lib/TileMath.js" as TileMath
 import "lib/RadarModel.js" as RadarModel
 
@@ -37,6 +39,14 @@ Panel {
   // The bar tracks the widget in its slot, not this nested panel, so anything
   // the popout coordinator compares against has to be the widget.
   readonly property var barIdentity: hostWidget || root
+
+  // Path to a bundled file, with the file:// prefix a resolved URL carries.
+  // The same shape Service.qml uses, for the same reason: a path assembled out
+  // of a home directory is a path that follows wherever it was planted, and
+  // the plugin's own directory is the one place that is not.
+  function pluginFile(name) {
+    return Qt.resolvedUrl(name).toString().replace("file://", "")
+  }
 
   // ---------------------------------------------------------------------------
   // Settings
@@ -769,6 +779,12 @@ Panel {
     frontIsA = !frontIsA
     // The caption moves with the picture, not with the request.
     recordShownFrame()
+    // A share is waiting on this frame to be drawn, and "drawn" is later than
+    // "all the tiles are here" by the length of the crossfade. So the grab is
+    // queued behind the fade rather than fired from inside it, which is what
+    // photographs a half-transparent layer and bakes the dissolve into every
+    // frame of a loop.
+    if (sharing) shareSettle.restart()
     // While playing, the layer now behind is idle: hand it the next frame so
     // its tiles decode during the hold, and the next swap is a crossfade
     // between two loaded frames instead of a wait. A cache hit answers
@@ -853,6 +869,21 @@ Panel {
   // fetching frames for a panel nobody has.
   Component.onDestruction: {
     if (manifestHeld && root.service && root.service.releaseManifest) root.service.releaseManifest()
+
+    // A share in progress must not outlive the panel. The grab that may be in
+    // flight is Qt's to finish, but the frames already on disk are this
+    // plugin's, and the run directory is named for the shell process that made
+    // it — so a shell reload or a plugin upgrade mid-share would leave it
+    // behind for good.
+    if (root.sharing) {
+      shareFrameTimer.stop()
+      shareSettle.stop()
+      shareFence.stop()
+      shareProc.cancelRequested = true
+      clipboardProc.cancelRequested = true
+      if (shareRunDir !== "")
+        shareProc.launch(root.shareHelper.concat(["abort", shareRunDir]))
+    }
   }
 
   function onOpened() {
@@ -932,8 +963,10 @@ Panel {
   readonly property var basemap: service ? service.basemap : null
 
   // Credit for everything drawn on the map, in one place so it cannot fall
-  // out of step with where the data actually comes from.
-  readonly property string attribution: "RainViewer · Natural Earth"
+  // out of step with where the data actually comes from. Per view, because a
+  // shared air-quality image is a picture of ECMWF's data and an image that
+  // does not say so is unattributed however the plugin behaves on screen.
+  readonly property string attribution: Share.attribution(activeCategory)
 
   function tileUrlA(z, x, y) { return root.tileUrlForFrame(root.frameA, z, x, y) }
   function tileUrlB(z, x, y) { return root.tileUrlForFrame(root.frameB, z, x, y) }
@@ -996,6 +1029,493 @@ Panel {
 
   Component.onCompleted: if (root.fetchingBusy) fetchingSettle.start()
 
+  // ---------------------------------------------------------------------------
+  // Sharing
+  //
+  // A share is a grab of the map item, and a grab is whatever is on screen —
+  // so the loop is the radar's own transport, driven one frame at a time
+  // instead of by the playback timer. Nothing here re-renders the map or
+  // re-requests a tile: it steps the frame the panel already knows how to
+  // stage, waits for that frame to be fully drawn, and grabs it.
+  //
+  // Which means the state it borrows has to come back afterwards. The frame
+  // index, the followed time and the transport all move during a share, and a
+  // share that left the panel on a different frame than the one the user was
+  // looking at would be the worst bug in this file.
+  // ---------------------------------------------------------------------------
+
+  // "" when nothing is being shared, otherwise "image" or "gif". Not a bool:
+  // the mode is also the extension, and the two must not be able to disagree.
+  property string shareMode: ""
+  readonly property bool sharing: shareMode !== ""
+  property int shareDone: 0
+  property int shareTotal: 1
+
+  // The frames of the loop, as indexes into `frames`, and where the helper
+  // said their pixels go. Both are filled in one step, from one answer.
+  property var shareIndexes: []
+  property var sharePaths: []
+  property string shareRunDir: ""
+  property int shareCursor: 0
+
+  // How long the frame list was when the share started. See captureNextFrame().
+  property int shareFramesToken: -1
+
+  // That an air-quality share is waiting on the overlay to be re-fetched at the
+  // export resolution, so releaseAirGrab() knows the grab it is about to ask
+  // for is one that is genuinely owed rather than a second attempt at one
+  // already in flight. Cleared by grabFrame(), which every grab passes through.
+  property bool shareAirWaiting: false
+
+  // How many times the map's own size a still is taken at, and the scale the
+  // air overlay's GetMap goes out at. One number for both: the point is that the
+  // overlay is rendered at the size it is saved at, so a grab scale and a
+  // request scale that disagreed would buy one at the other's expense.
+  //
+  // Three is as far as it goes while the frame still fits what share.py will
+  // accept: the largest map the panel will build is 560x320, so 3x is 1680x960
+  // against a ceiling of four times that in pixels. A loop is taken at 1x —
+  // twice the pixels across eight frames is a file nobody waits for, and a GIF
+  // is watched small enough that the extra pixels would not survive the palette.
+  readonly property int stillScale: shareMode === "gif" ? 1 : 3
+
+  // What the file is called, decided once at the start so a loop lands in one
+  // file rather than one file per minute of the clock.
+  property string shareStem: ""
+
+  // Borrowed from the panel for the length of the share, and handed back by
+  // endShare() on every path out — the successful one and the failed ones.
+  property int shareSavedIndex: -1
+  property bool shareSavedPlaying: false
+  property bool shareSavedFollowing: true
+
+  // The capture's own path to the helper. Absolute interpreter, absolute
+  // helper, -I so no PYTHONPATH rides in, -S because nothing outside the
+  // standard library is used and the site directory is another process's
+  // decision. Every argument is its own array element, so nothing here is
+  // ever parsed as a shell.
+  readonly property var shareHelper: ["/usr/bin/python3", "-I", "-S", pluginFile("share.py")]
+
+  // The window between "this frame is on screen" and "this frame is what a
+  // grab would photograph". The tile swap is already fenced by swapWatchdog;
+  // the crossfade that finishes it is 380 ms, so a grab taken the moment
+  // `backReady` goes true photographs a half-transparent layer and bakes the
+  // dissolve into every frame of a loop.
+  readonly property int shareSettleMs: 450
+
+  function requestShare() {
+    if (root.sharing || root.settingsOpen) return
+    // Only the radar has a transport to replay, so only the radar has a loop
+    // to make. Every other view offers the still and nothing else, which is
+    // the answer the timeline already gives: a CAMS forecast is never
+    // scrubbed, so there is no sequence of it to animate.
+    if (!root.radarMode) {
+      root.startShare("image")
+      return
+    }
+    shareChooser.opened = true
+  }
+
+  // Take whichever option the chooser has selected, whether it was arrived at
+  // with the keyboard or with the mouse.
+  //
+  // One function for all three ways in — the right button, the left button and
+  // Return — because three copies of an if/else is three chances to map the
+  // left button to "close the dialog", which is precisely what happened: the
+  // image was the left button, and choosing it did nothing at all.
+  function chooseShareFormat() {
+    if (shareChooser.selectedIndex === 0) root.startShare("image")
+    else root.startShare("gif")
+  }
+
+  function startShare(mode) {
+    if (root.sharing) return
+    shareChooser.opened = false
+
+    var wanted = Share.windowFor(mode, frames.length, frameIndex)
+    if (mode === "gif" && wanted.length < 2) {
+      // A loop of one is a still with extra steps, and a worse answer than the
+      // PNG would have been.
+      root.endShare("Nothing to animate — one radar frame is all there is", false)
+      return
+    }
+    if (wanted.length === 0) {
+      root.endShare("There is no frame to share yet", false)
+      return
+    }
+
+    root.shareMode = mode
+    root.shareTotal = wanted.length
+    root.shareIndexes = wanted
+    root.shareCursor = 0
+    root.sharePaths = []
+    root.shareRunDir = ""
+    root.shareStem = Share.fileName(Share.kindFor(activeCategory, activeLayer, ""), Date.now())
+
+    root.shareSavedIndex = frameIndex
+    root.shareSavedPlaying = playing
+    root.shareSavedFollowing = followingLatest
+    root.shareFramesToken = frames.length
+
+    // setTimelineIndex() pauses the transport on every frame it stages, so
+    // this is belt and braces — and it is also the pause that would apply to a
+    // still, where the frame being shared is usually the one already on screen
+    // and nothing is ever staged.
+    playing = false
+
+    root.sharePending = "begin"
+    shareProc.launch(root.shareHelper.concat(["begin", String(wanted.length)]))
+  }
+
+  // Escape, the button in the hint row, and the failure paths all land here or
+  // on endShare(). The run directory is removed by a separate call because
+  // there is no `finish` on the way out of a cancel: the frames are already on
+  // disk and nothing else is going to look at them.
+  function endShare(headline, ok) {
+    shareFrameTimer.stop()
+    shareSettle.stop()
+    shareFence.stop()
+    // Read before it is cleared: the reason is only useful while there is
+    // still a share to explain.
+    var why = root.shareReason()
+    // Whatever the helper is still doing, its answer is no longer wanted. A
+    // cancel is answered after the share is already over, and treating that
+    // answer as a result is how a cancelled share ends up reporting that the
+    // helper said something unexpected.
+    root.sharePending = ""
+
+    root.shareMode = ""
+    root.shareIndexes = []
+    root.sharePaths = []
+    root.shareRunDir = ""
+    root.shareCursor = 0
+    root.shareDone = 0
+    root.shareAirWaiting = false
+
+    // Assigning the index stages the frame through onFrameIndexChanged, so
+    // this is the whole of putting the picture back.
+    if (root.shareSavedIndex >= 0 && root.shareSavedIndex < frames.length)
+      frameIndex = root.shareSavedIndex
+    playing = root.shareSavedPlaying
+    followingLatest = root.shareSavedFollowing
+
+    root.shareWhy = ""
+    if (headline !== "" && root.service) root.service.reportShare(headline, ok, why)
+  }
+
+  function captureNextFrame() {
+    if (!root.sharing) return
+    // A new manifest replaces the frame list every ten minutes, and the frames
+    // a radar share is walking are indexes into the list it started with. Ten
+    // seconds of sharing will not usually meet one, and the one time it does
+    // the indexes name different frames than they did — so the share is
+    // stopped rather than allowed to capture the wrong weather. Only a radar
+    // share is walking indexes, and only a radar share can be caught by this.
+    if (root.radarMode && frames.length !== root.shareFramesToken) {
+      root.failShare("The radar frames changed — try sharing again")
+      return
+    }
+    if (root.shareCursor >= root.sharePaths.length) {
+      root.publishShare()
+      return
+    }
+
+    root.shareDone = root.shareCursor + 1
+
+    if (!root.radarMode) {
+      // There is nothing to stage: the map is already showing the layer and
+      // the forecast step this share means, so the grab is the whole of the
+      // work. Staging a radar frame here would be a no-op — setTimelineIndex()
+      // refuses a view that is not the radar — and the only thing left to
+      // release the grab would be the eight-second fence, which would make
+      // every air-quality share feel like it had hung.
+      //
+      // Except that the share has just raised the overlay's resolution, and the
+      // layer is holding the coarser picture until its own GetMap answers. Both
+      // of its buffers are transparent while that request is out, so grabbing
+      // now would photograph a map with no overlay on it at all — the thing the
+      // legend is in the picture to explain. So this waits, and releaseAirGrab()
+      // is what releases it. The fence stays as the floor, for a GetMap that
+      // never answers: an air-quality share without its overlay, rather than
+      // one that never finishes.
+      if (map.airStale) {
+        shareAirWaiting = true
+        shareFence.restart()
+        return
+      }
+      grabFrame()
+      return
+    }
+
+    var index = root.shareIndexes[root.shareCursor]
+
+    if (index === frameIndex) {
+      // The frame is already on screen, and `setTimelineIndex` assigns
+      // `frameIndex = index` — which fires no signal when the value is
+      // unchanged, so `showFrame` never runs, the swap is never pending, and
+      // `finishSwap` never releases a grab. The crossfade that is already
+      // settling is the only wait this needs.
+      //
+      // A still is always this case, because a still is the frame the user is
+      // looking at. A loop hits it whenever the window includes the frame the
+      // panel was left on. Without this branch every still waited out the fence
+      // — eight seconds of a map that is not moving, under a progress row that
+      // says it is rendering.
+      shareSettle.restart()
+      return
+    }
+
+    setTimelineIndex(index)
+    // The swap lands when the tiles are all here, and swapWatchdog forces it
+    // two seconds later if they never are. Either way finishSwap() releases
+    // the settle, and the settle releases the grab. The fence below is the
+    // third thing that can release it, for a frame where neither of the other
+    // two does — on a bad connection that degrades to a rough loop rather than
+    // to a share that never finishes.
+    shareFence.restart()
+  }
+
+  // The air overlay is done being waited for, so the grab an air-quality share
+  // was holding back is released. Both outcomes release it — the sharper
+  // overlay arrived, or the layer gave up — because the fence releases it
+  // either way, and a share that waited for an answer to a question already
+  // answered is just a slower share.
+  //
+  // The flag is the guard that matters: without it, an overlay that lands after
+  // the fence has already taken its grab would ask for a second one, and two
+  // overlapping grabs of one item each photograph the other's half-finished
+  // state.
+  function releaseAirGrab() {
+    if (!root.shareAirWaiting) return
+    grabFrame()
+  }
+
+  function grabFrame() {
+    if (!root.sharing) return
+    // The fence has done its job. Left running it would open a second grab of
+    // the same item while the first was still queued, and two overlapping
+    // grabs of one item each photograph the other's half-finished state.
+    shareFence.stop()
+    // The same argument, for the air overlay: it can raise a grab of its own
+    // accord the moment its GetMap lands, and it cannot know whether the grab
+    // released by the fence is still in flight. Cleared here because this is
+    // the one place every grab passes through.
+    shareAirWaiting = false
+
+    // The still is grabbed at three times the map's own size, because it is the
+    // one meant to be posted; see stillScale, which the air overlay's request
+    // is made at too.
+    var scale = root.stillScale
+    var target = Qt.size(Math.max(1, Math.round(map.width * scale)),
+      Math.max(1, Math.round(map.height * scale)))
+    var destination = root.sharePaths[root.shareCursor]
+    var next = root.shareCursor + 1
+
+    map.grabToImage(function(result) {
+      if (!root.sharing) return
+      if (!result.saveToFile(destination)) {
+        root.failShare("Could not write the captured frame")
+        return
+      }
+      root.shareCursor = next
+      // On to the next frame — or, once they are all written, to the publish.
+      // One step of this loop is the whole of the state machine: the timer
+      // calls captureNextFrame(), which either stages the next frame or hands
+      // the finished run to the helper.
+      shareFrameTimer.restart()
+    }, target)
+  }
+
+  // Every way out of a share that does not finish, with its frames cleaned up
+  // behind it. Cancel, a frame that could not be written, a frame list that
+  // moved underneath the share — they differ only in what the user is told,
+  // and the bookkeeping that follows is the same every time.
+  function failShare(headline) {
+    shareChooser.opened = false
+    shareFrameTimer.stop()
+    shareSettle.stop()
+    shareFence.stop()
+    if (shareRunDir !== "") {
+      root.sharePending = "abort"
+      shareProc.launch(root.shareHelper.concat(["abort", shareRunDir]))
+    }
+    root.endShare(headline, false)
+  }
+
+  function publishShare() {
+    if (shareRunDir === "") {
+      root.failShare("The share never started")
+      return
+    }
+    root.sharePending = "finish"
+    shareProc.launch(root.shareHelper.concat(
+      ["finish", shareRunDir, root.shareMode, root.shareStem]))
+  }
+
+  // The step from one captured frame to the next. It calls captureNextFrame()
+  // rather than grabFrame(), because captureNextFrame() is what notices there
+  // are no frames left — a timer that grabbed unconditionally would walk off
+  // the end of the list and try to write a file that was never named.
+  Timer {
+    id: shareFrameTimer
+    interval: 40
+    onTriggered: root.captureNextFrame()
+  }
+
+  // The pause between a frame being on screen and it being safe to
+  // photograph. Two callers, one wait: a swap that has just started
+  // crossfading, and a frame that was already showing and never had to.
+  Timer {
+    id: shareSettle
+    interval: root.shareSettleMs
+    onTriggered: root.grabFrame()
+  }
+
+  // The last thing that can release a grab, for a frame whose tiles never
+  // arrive and whose watchdog therefore never fires because the swap was never
+  // pending. Long enough that it is not what happens on a good connection.
+  Timer {
+    id: shareFence
+    interval: 8000
+    onTriggered: root.grabFrame()
+  }
+
+  BoundedProcess {
+    id: shareProc
+    // The helper's reason for failing, which is otherwise thrown away.
+    //
+    // stderr on a Quickshell process that has not claimed it goes to the
+    // shell's log, which is where a developer looks and not where a person
+    // with a failed share looks. It arrives here instead, capped, and becomes
+    // the body of the toast — so a refusal says what was refused rather than
+    // only that it was. Bounded like the stdout, because it is a stream into
+    // this process either way.
+    //
+    // The collector only accumulates. It must not decide anything, because
+    // `onStreamFinished` fires before the exit code exists, so a refusal
+    // decided there would read as one that completed. The text is read in
+    // onResponded, where the code is known — the arrangement BoundedProcess
+    // itself uses for stdout.
+    stderr: StdioCollector {
+      id: shareErrors
+      waitForEnd: true
+    }
+    onResponded: function(exitCode, text) {
+      // Read only. `text` is a read-only property backed by the collector's
+      // own buffer, and assigning to it throws — which aborts this handler
+      // before applyShareResponse() runs, so the run directory gets created and
+      // its name never arrives, and the share waits for a cancel that cannot
+      // clean up after it. Nothing needs clearing either: the collector belongs
+      // to this process, and launching it again starts a new one.
+      //
+      // The first line, and only the first: a helper that printed a stack has
+      // its first sentence in the toast and the rest dropped.
+      root.shareWhy = shareErrors.text.split("\n")[0]
+      root.applyShareResponse(exitCode, text)
+    }
+  }
+
+  // What the helper said, when it said something. Shown once, in the toast,
+  // and dropped with the share.
+  property string shareWhy: ""
+
+  // A helper sentence in a notification body, which is a sink the plugin
+  // cannot render as plain text. Stripped of the characters that start markup,
+  // of the controls, and of the bidi overrides that can reorder what the user
+  // reads. The rest of it is this plugin's own wording about the user's own
+  // files, so there is nothing else to remove.
+  function shareReason() {
+    if (root.shareWhy === "") return "The share helper refused without saying why."
+    return Share.plain(root.shareWhy)
+  }
+
+  // stdout crosses a process boundary and is collected into the shell process,
+  // so its ceiling is checked on this side too. The helper applies the same
+  // 4 KiB bound before it prints; this is the same bound one layer over, where
+  // the bytes already exist.
+  readonly property int shareAnswerMax: 4096
+
+  // What the helper is currently being asked, so an answer is only ever read
+  // against the question that asked for it. Dispatching on whether a run
+  // directory happens to be set looks like it works and does not: the answer to
+  // `finish` arrives while the run directory is still set, and the answer to a
+  // cancel's `abort` arrives after the share is over.
+  property string sharePending: ""
+
+  function applyShareResponse(exitCode, text) {
+    var asked = root.sharePending
+    if (asked === "") return
+    root.sharePending = ""
+
+    if (text.length > root.shareAnswerMax) {
+      root.endShare("The share helper said more than it should have", false)
+      return
+    }
+
+    if (asked === "begin") {
+      root.applyShareBegun(exitCode, text)
+      return
+    }
+    if (asked === "finish") {
+      root.applyShareFinished(exitCode, text)
+      return
+    }
+    // "abort" is the helper cleaning up after a cancel. There is nothing to
+    // report: the user was already told the share was cancelled, and the only
+    // thing left to do is let the run directory go.
+  }
+
+  function applyShareBegun(exitCode, text) {
+    if (exitCode !== 0) {
+      root.endShare("The map was not saved", false)
+      return
+    }
+    // A `begin`: the run directory, then one absolute path per frame. Both
+    // shapes are checked rather than believed — a path that is not a path, or
+    // a count that is not the count asked for, is a helper behaving in a way
+    // this panel does not understand, and a frame written somewhere else is
+    // worse than no share.
+    var lines = text.trim().split("\n")
+    if (lines.length !== root.shareTotal + 1
+      || !/^\/[^\n\t]{1,255}$/.test(lines[0])
+      || !/^\/[^\n\t]{1,255}\.png$/.test(lines[1])) {
+      root.endShare("The helper returned something unexpected", false)
+      return
+    }
+    root.shareRunDir = lines[0].split("/").pop()
+    root.sharePaths = lines.slice(1)
+    root.captureNextFrame()
+  }
+
+  function applyShareFinished(exitCode, text) {
+    if (exitCode !== 0) {
+      root.endShare("The map was not saved", false)
+      return
+    }
+    var answer = text.trim().split("\n")[0].split("\t")
+    if (answer.length !== 2 || !/^\/[^\n\t]{1,255}\.(png|gif)$/.test(answer[0])
+      || !/^[0-9]{1,12}$/.test(answer[1])) {
+      root.endShare("The helper returned something unexpected", false)
+      return
+    }
+    // The name is reduced to [a-z0-9-] by Share.fileName() before it ever
+    // reaches a sink, so the notification quotes the file name without a
+    // strip pass over a string built out of a remote layer title.
+    root.endShare("Saved " + answer[0].split("/").pop(), true)
+    clipboardProc.launch(["/usr/bin/wl-copy", "--type",
+      answer[0].endsWith(".gif") ? "image/gif" : "image/png", answer[0]])
+  }
+
+  // The clipboard is the integration: a pasted image is a shared map without
+  // the user opening a file manager to find it. wl-copy reads a named file, so
+  // the path crosses as an argument and no image bytes do. Nothing comes back
+  // out of it, which is why it collects no output.
+  BoundedProcess {
+    id: clipboardProc
+  }
+
+  // Which of the two share formats is offered, asked as a question because the
+  // radar is the only view where the answer is not obvious. `ConfirmDialog` is
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -1003,6 +1523,11 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: true
+    // The panel's key catcher turns keys into semantic signals rather than
+    // exposing a hook for a dialog's own handler, so the chooser is driven
+    // through the three signals it does emit. It stays the focus target: the
+    // host hands focus to `focusTarget` and this is the one thing that has
+    // always held it.
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(560))
     contentHeight: panel.fittedContentHeight(
@@ -1017,22 +1542,64 @@ Panel {
       // timeline and zoom the map. Same for the settings fields, where
       // "s" would otherwise shut the page mid-edit, and for the first-run
       // prompt, where the question owns the whole keyboard.
-      blocked: root.editingLocation || root.settingsHasFocus || root.locationPromptOpen
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) {
-        if (root.bar && typeof root.bar.switchPanelFrom === "function")
-          root.bar.switchPanelFrom(root.barIdentity, direction)
+    blocked: root.editingLocation || root.settingsHasFocus || root.locationPromptOpen
+    // Escape, and the button in the hint row, both land here. The chooser is
+    // answered by the keys handler below, so this is a second door to the same
+    // answer rather than the only one. A share in progress means "stop that"
+    // rather than "close this", because the share is the thing under the user's
+    // hands and the thing that can take seconds; the panel can be closed a
+    // second later.
+    onCloseRequested: {
+      if (shareChooser.opened) { root.shareChooser.opened = false; return }
+      if (root.sharing) root.failShare("Share cancelled")
+      else root.close()
+    }
+    onTabRequested: function(direction) {
+      // Tab moves between the two options rather than to the neighbouring bar
+      // panel, because the chooser is the only thing on screen that can be
+      // acted on.
+      if (shareChooser.opened) {
+        shareChooser.selectedIndex = shareChooser.selectedIndex === 0 ? 1 : 0
+        return
       }
-      onReturnRequested: if (root.radarMode) root.playing = !root.playing
+      if (root.bar && typeof root.bar.switchPanelFrom === "function")
+        root.bar.switchPanelFrom(root.barIdentity, direction)
+    }
+    onReturnRequested: {
+      if (shareChooser.opened) {
+        root.chooseShareFormat()
+        return
+      }
+      if (root.radarMode) root.playing = !root.playing
+    }
 
       Keys.onPressed: function(event) {
+        // The chooser owns the keyboard while it is up. It has to be this
+        // handler rather than the key catcher's signals, because the catcher
+        // turns keys into meanings — scrub, zoom, play — and none of those mean
+        // anything over a question asking which file to write.
+        if (shareChooser.opened) {
+          if (event.key === Qt.Key_Escape) root.shareChooser.opened = false
+          else if (event.key === Qt.Key_Left || event.key === Qt.Key_Right) {
+            shareChooser.selectedIndex = shareChooser.selectedIndex === 0 ? 1 : 0
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            root.chooseShareFormat()
+          }
+          event.accepted = true
+          return
+        }
+
         if (event.text === "s" || event.text === "S") {
           root.toggleSettings()
           event.accepted = true
-        } else if (event.key === Qt.Key_Left && root.radarMode) {
+        } else if (event.text === "p" || event.text === "P") {
+          if (root.sharing) root.failShare("Share cancelled")
+          else root.requestShare()
+          event.accepted = true
+        } else if (event.key === Qt.Key_Left && root.radarMode && !root.sharing) {
           root.setTimelineIndex(Math.max(0, root.timelineIndex - 1))
           event.accepted = true
-        } else if (event.key === Qt.Key_Right && root.radarMode) {
+        } else if (event.key === Qt.Key_Right && root.radarMode && !root.sharing) {
           root.setTimelineIndex(Math.min(root.timelineFrames.length - 1, root.timelineIndex + 1))
           event.accepted = true
         } else if (event.key === Qt.Key_Plus || event.key === Qt.Key_Equal) {
@@ -1113,6 +1680,21 @@ Panel {
             airLayerName: root.shownAirLayerName
             airStepTime: root.shownAirStepTime
 
+            // The share. `exporting` puts the legend inside the grab and a
+            // veil over the map while frames are being captured; the legend
+            // fields are the same ones the panel's own strip below is bound
+            // to, so the two cannot disagree about what the map is drawing.
+            // `exportScale` asks the air overlay for the resolution a still is
+            // about to be grabbed at — a loop is grabbed at the panel's own
+            // size, and has nothing to spend.
+            exporting: root.sharing
+            exportScale: root.stillScale
+            legendMode: root.airShown ? root.activeCategory : "radar"
+            legendLabel: root.activeLayer ? CamsModel.layerLabel(root.activeLayer) : ""
+            legendSpecies: root.activeLayer ? (root.activeLayer.species || "") : ""
+            onShareRequested: root.requestShare()
+            onAirSettled: root.releaseAirGrab()
+
             onDragged: function(latitude, longitude) {
               root.viewLatitude = TileMath.constrainLatitude(latitude, root.zoom, root.mapHeight)
               // Normalised as it is stored, so panning east indefinitely keeps
@@ -1162,14 +1744,52 @@ Panel {
           // The map's legend, docked as a colour strip under the map: it names
           // whichever ramp the map is drawing, in the same column and at the same
           // width, so it reads as part of the map without covering any of it.
+          //
+          // While a share is running this row is replaced by the progress
+          // line, and the strip moves inside the map (ui/MapCanvas.qml) where
+          // the grab can reach it. The progress line is deliberately not there:
+          // it would be photographed into every frame of the loop.
           LegendStrip {
             width: parent.width
+            visible: !root.sharing
             bar: root.bar
             mode: root.airShown ? root.activeCategory : "radar"
             layerLabel: root.activeLayer ? CamsModel.layerLabel(root.activeLayer) : ""
             layerSpecies: root.activeLayer ? (root.activeLayer.species || "") : ""
-            lowEnd: root.airLegendEnds ? root.airLegendEnds.low : ""
-            highEnd: root.airLegendEnds ? root.airLegendEnds.high : ""
+          }
+
+          // What a share is doing, and how to stop it. Shares take a few
+          // seconds — long enough that a control which does nothing looks
+          // broken, so the affordance to cancel is on screen rather than only
+          // on Escape.
+          Row {
+            width: parent.width
+            visible: root.sharing
+            spacing: Style.space(10)
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - cancelShare.width - Style.space(10)
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              text: root.shareMode === "gif"
+                ? "Rendering frame " + root.shareDone + " of " + root.shareTotal
+                : "Rendering…"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Button {
+              id: cancelShare
+              anchors.verticalCenter: parent.verticalCenter
+              text: "cancel"
+              fontFamily: Style.font.family
+              foreground: Color.foreground
+              background: Color.popups.background
+              bordered: true
+              onClicked: root.failShare("Share cancelled")
+            }
           }
 
           LayerPicker {
@@ -1466,6 +2086,27 @@ Panel {
               onClicked: root.toggleSettings()
             }
           }
+
+          // Share, on the same terms: a keycap and a label, both live. This
+          // one earns its place more than the others do — the button in the
+          // corner of the map is small, and a map worth sharing is usually a
+          // map somebody has just scrubbed to, which is a keyboard action.
+          KeyCap { label: "P"; onActivated: root.requestShare() }
+          Text {
+            textFormat: Text.PlainText
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.sharing ? "cancel share" : "share map"
+            color: Qt.darker(root.settingsForeground, 1.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: if (root.sharing) root.failShare("Share cancelled"); else root.requestShare()
+            }
+          }
         }
       }
 
@@ -1643,6 +2284,49 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      // The share chooser, as the last child of the window that holds the map.
+      //
+      // This placement is the whole reason it works. `KeyboardPanel` is a
+      // PanelWindow — a separate window, not an item in this one — so a dialog
+      // declared out at the panel's own level would be in a different window
+      // from the map, and no `z` would ever raise it above one. Declared in
+      // here it shares that window, and `z` does the rest: the key catcher
+      // above fills it with the map and its own mouse handling, so without a z
+      // the dialog would open, paint underneath, and eat no clicks — which
+      // looks exactly like the share button doing nothing. The host places its
+      // own dialogs the same way; see the clipboard plugin's clear-history
+      // prompt.
+      ConfirmDialog {
+        id: shareChooser
+        z: 10
+        anchors.fill: parent
+        message: "Share this map as"
+        cancelText: "PNG image"
+        confirmText: "Animated GIF"
+        selectedIndex: 1
+        onConfirmed: root.startShare("gif")
+        // The two buttons and the dismissing gestures all arrive as one signal
+        // pair, and they are not the same thing:
+        //
+        //   confirmed()  the right button   — Animated GIF
+        //   canceled()   the left button    — PNG image
+        //   canceled()   a click on the scrim — neither
+        //
+        // So the left button cannot simply be treated as a dismissal, or
+        // "PNG image" closes the dialog and shares nothing — which is exactly
+        // what it did. `selectedIndex` is what tells the button from the scrim:
+        // a button sets the index to its own position as it is pressed, and the
+        // scrim leaves it where it was, which is 1 unless the reader moved it.
+        //
+        // Escape never comes here. It is handled in the key catcher above,
+        // which closes the dialog without calling handleKey, so there is no
+        // way for it to be read as a choice.
+        onCanceled: {
+          if (shareChooser.selectedIndex === 0) root.startShare("image")
+          else root.shareChooser.opened = false
         }
       }
     }
